@@ -4,14 +4,7 @@ let localStream = null;
 let peerConnections = new Map();
 let myId = null;
 let authToken = null;
-let cameraKey = null;
 let currentUser = null;
-let currentTab = 'viewer';
-let currentAdminSection = 'users';
-let editingUser = null;
-let editingCamera = null;
-let selectedCameraId = null;
-let allCameraConfigs = [];
 
 // Variables para detección de movimiento
 let motionDetectionEnabled = false;
@@ -20,9 +13,9 @@ let previousFrame = null;
 let motionCanvas = null;
 let motionContext = null;
 let lastMotionAlert = 0;
-const MOTION_THRESHOLD = 30; // Sensibilidad (menor = más sensible)
-const MOTION_PIXEL_THRESHOLD = 0.02; // 2% de píxeles deben cambiar
-const ALERT_COOLDOWN = 5000; // 5 segundos entre alertas
+const MOTION_THRESHOLD = 30;
+const MOTION_PIXEL_THRESHOLD = 0.02;
+const ALERT_COOLDOWN = 5000;
 
 const iceServers = {
     iceServers: [
@@ -32,27 +25,11 @@ const iceServers = {
 };
 
 // ==================== INICIALIZACIÓN ====================
-window.addEventListener('DOMContentLoaded', async () => {
+window.addEventListener('DOMContentLoaded', () => {
     setupCameraControls();
-
-    const hasUserSession = await verifySession();
-    if (hasUserSession) {
-        showMainView();
-        return;
-    }
-
-    const hasCameraSession = await verifyCameraKey();
-    if (hasCameraSession) {
-        showCameraView();
-        return;
-    }
-
+    
     document.getElementById('login-password').addEventListener('keypress', (e) => {
         if (e.key === 'Enter') login();
-    });
-
-    document.getElementById('camera-key').addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') loginCamera();
     });
 });
 
@@ -64,23 +41,10 @@ window.addEventListener('beforeunload', () => {
 });
 
 // ==================== LOGIN ====================
-function switchLoginMode(mode) {
-    const buttons = document.querySelectorAll('.tab-selector button');
-    buttons.forEach(btn => btn.classList.remove('active'));
-    event.target.classList.add('active');
-
-    if (mode === 'user') {
-        document.getElementById('user-login').classList.remove('hidden');
-        document.getElementById('camera-login').classList.add('hidden');
-    } else {
-        document.getElementById('user-login').classList.add('hidden');
-        document.getElementById('camera-login').classList.remove('hidden');
-    }
-}
-
 async function login() {
     const username = document.getElementById('login-username').value.trim();
     const password = document.getElementById('login-password').value;
+    const role = document.getElementById('login-role').value;
 
     if (!username || !password) {
         showStatus('login-status', 'Por favor completa todos los campos', 'error');
@@ -88,55 +52,50 @@ async function login() {
     }
 
     try {
+        showStatus('login-status', 'Autenticando...', 'info');
+
         const response = await fetch('/api/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username, password })
+            body: JSON.stringify({ username, password, role })
         });
 
         const data = await response.json();
 
-        if (data.success) {
+        if (response.ok && data.token) {
             authToken = data.token;
-            currentUser = data.user;
+            currentUser = { username: data.userId, role: data.role };
             localStorage.setItem('authToken', authToken);
-            showMainView();
+            
+            if (data.role === 'camera') {
+                showCameraInterface();
+            } else {
+                showViewerInterface();
+            }
         } else {
-            showStatus('login-status', data.error || 'Error al iniciar sesión', 'error');
+            showStatus('login-status', data.error || 'Credenciales inválidas', 'error');
         }
     } catch (error) {
+        console.error('Error en login:', error);
         showStatus('login-status', 'Error de conexión con el servidor', 'error');
     }
 }
 
-async function loginCamera() {
-    const key = document.getElementById('camera-key').value.trim();
+function showCameraInterface() {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app-screen').classList.add('active');
+    document.getElementById('current-user').textContent = currentUser.username;
+    document.getElementById('current-role').textContent = '📹 Cámara';
+    selectMode('camera');
+}
 
-    if (!key) {
-        showStatus('camera-login-status', 'Por favor ingresa la clave', 'error');
-        return;
-    }
-
-    try {
-        const response = await fetch('/api/verify-camera-key', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ key })
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            cameraKey = key;
-            localStorage.setItem('cameraKey', cameraKey);
-            await loadCameraConfigs();
-            showCameraView();
-        } else {
-            showStatus('camera-login-status', 'Clave incorrecta', 'error');
-        }
-    } catch (error) {
-        showStatus('camera-login-status', 'Error de conexión', 'error');
-    }
+function showViewerInterface() {
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app-screen').classList.add('active');
+    document.getElementById('current-user').textContent = currentUser.username;
+    document.getElementById('current-role').textContent = '👁️ Viewer';
+    selectMode('viewer');
+    connectViewer();
 }
 
 async function logout() {
@@ -151,6 +110,9 @@ async function logout() {
     }
 
     if (ws) ws.close();
+    if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
+    }
     peerConnections.forEach(pc => pc.close());
     peerConnections.clear();
 
@@ -158,151 +120,26 @@ async function logout() {
     currentUser = null;
     localStorage.removeItem('authToken');
 
-    document.getElementById('main-view').classList.remove('active');
-    document.getElementById('login-view').classList.add('active');
-}
-
-function logoutCamera() {
-    if (localStream) {
-        localStream.getTracks().forEach(track => track.stop());
-    }
-    if (ws) ws.close();
-    peerConnections.forEach(pc => pc.close());
-    peerConnections.clear();
-
-    cameraKey = null;
-    localStorage.removeItem('cameraKey');
-
-    document.getElementById('camera-view').classList.remove('active');
-    document.getElementById('login-view').classList.add('active');
-}
-
-async function verifySession() {
-    const token = localStorage.getItem('authToken');
-    if (!token) return false;
-
-    try {
-        const response = await fetch('/api/verify', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token })
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            authToken = token;
-            currentUser = data.user;
-            return true;
-        }
-    } catch (error) {
-        console.error('Error verificando sesión:', error);
-    }
-
-    localStorage.removeItem('authToken');
-    return false;
-}
-
-async function verifyCameraKey() {
-    const key = localStorage.getItem('cameraKey');
-    if (!key) return false;
-
-    try {
-        const response = await fetch('/api/verify-camera-key', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ key })
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            cameraKey = key;
-            await loadCameraConfigs();
-            return true;
-        }
-    } catch (error) {
-        console.error('Error verificando clave:', error);
-    }
-
-    localStorage.removeItem('cameraKey');
-    return false;
-}
-
-function showMainView() {
-    document.getElementById('login-view').classList.remove('active');
-    document.getElementById('main-view').classList.add('active');
-
-    document.getElementById('user-badge').textContent = currentUser.username;
-    
-    if (currentUser.role === 'admin') {
-        document.getElementById('role-badge').className = 'admin-badge';
-        document.getElementById('role-badge').textContent = '👑 Admin';
-        document.getElementById('admin-tab').classList.remove('hidden');
-    } else {
-        document.getElementById('role-badge').className = 'user-badge';
-        document.getElementById('role-badge').textContent = '👤 Usuario';
-    }
-
-    connectViewer();
-}
-
-async function showCameraView() {
-    document.getElementById('login-view').classList.remove('active');
-    document.getElementById('camera-view').classList.add('active');
-
-    const select = document.getElementById('camera-select');
-    select.innerHTML = '<option value="">Cargando cámaras...</option>';
-    
-    setTimeout(() => {
-        select.innerHTML = '<option value="">Selecciona una cámara...</option>';
-        
-        if (allCameraConfigs.length === 0) {
-            select.innerHTML = '<option value="">No hay cámaras registradas</option>';
-            showStatus('camera-status', 'No hay cámaras registradas en el sistema. Contacta al administrador.', 'error');
-        } else {
-            allCameraConfigs.forEach(cam => {
-                const option = document.createElement('option');
-                option.value = cam.id;
-                option.textContent = `${cam.name}${cam.location ? ' - ' + cam.location : ''}`;
-                select.appendChild(option);
-            });
-        }
-    }, 500);
+    document.getElementById('app-screen').classList.remove('active');
+    document.getElementById('login-screen').style.display = 'flex';
+    document.getElementById('login-username').value = '';
+    document.getElementById('login-password').value = '';
+    showStatus('login-status', '', 'info');
 }
 
 // ==================== NAVEGACIÓN ====================
-function showTab(tabName) {
-    currentTab = tabName;
-
-    document.querySelectorAll('#main-tabs .tab').forEach(tab => tab.classList.remove('active'));
-    event.target.classList.add('active');
-
-    document.getElementById('viewer-tab').classList.add('hidden');
-    document.getElementById('admin-tab-content').classList.add('hidden');
-
-    if (tabName === 'viewer') {
-        document.getElementById('viewer-tab').classList.remove('hidden');
-    } else if (tabName === 'admin') {
-        document.getElementById('admin-tab-content').classList.remove('hidden');
-        loadUsers();
-        loadCameraConfigsAdmin();
-    }
-}
-
-function showAdminSection(section) {
-    currentAdminSection = section;
-
-    document.querySelectorAll('#admin-tab-content .tabs .tab').forEach(tab => tab.classList.remove('active'));
-    event.target.classList.add('active');
-
-    document.getElementById('admin-users').classList.add('hidden');
-    document.getElementById('admin-cameras').classList.add('hidden');
-
-    if (section === 'users') {
-        document.getElementById('admin-users').classList.remove('hidden');
-    } else if (section === 'cameras') {
-        document.getElementById('admin-cameras').classList.remove('hidden');
+function selectMode(mode) {
+    const buttons = document.querySelectorAll('.mode-btn');
+    buttons.forEach(btn => btn.classList.remove('active'));
+    
+    if (mode === 'camera') {
+        buttons[0].classList.add('active');
+        document.getElementById('camera-section').classList.add('active');
+        document.getElementById('viewer-section').classList.remove('active');
+    } else {
+        buttons[1].classList.add('active');
+        document.getElementById('viewer-section').classList.add('active');
+        document.getElementById('camera-section').classList.remove('active');
     }
 }
 
@@ -518,35 +355,8 @@ function handleMotionAlert(data) {
 }
 
 // ==================== CÁMARA ====================
-async function loadCameraConfigs() {
-    try {
-        const response = await fetch('/api/camera-configs', {
-            headers: { 'Authorization': `Bearer ${cameraKey}` }
-        });
-        
-        if (!response.ok) {
-            console.error('Error al cargar cámaras:', response.status);
-            allCameraConfigs = [];
-            return;
-        }
-        
-        const data = await response.json();
-        allCameraConfigs = data.cameras || [];
-        console.log('Cámaras cargadas:', allCameraConfigs.length);
-    } catch (error) {
-        console.error('Error cargando configuraciones:', error);
-        allCameraConfigs = [];
-    }
-}
-
 async function startCamera() {
-    selectedCameraId = document.getElementById('camera-select').value;
-    
-    if (!selectedCameraId) {
-        showStatus('camera-status', 'Por favor selecciona una cámara', 'error');
-        return;
-    }
-
+    const cameraName = document.getElementById('camera-name').value.trim();
     const quality = document.getElementById('video-quality').value;
 
     try {
@@ -597,9 +407,8 @@ async function startCamera() {
 
         ws.onopen = () => {
             ws.send(JSON.stringify({
-                type: 'register-camera',
-                cameraId: selectedCameraId,
-                key: cameraKey
+                type: 'authenticate',
+                token: authToken
             }));
         };
 
@@ -607,22 +416,29 @@ async function startCamera() {
             const data = JSON.parse(event.data);
             
             switch(data.type) {
+                case 'authenticated':
+                    ws.send(JSON.stringify({
+                        type: 'register-camera',
+                        name: cameraName
+                    }));
+                    break;
+
                 case 'registered':
                     myId = data.id;
-                    const cameraName = data.name;
                     console.log('✅ Cámara registrada con ID:', myId);
                     showStatus('camera-status', '✅ Transmitiendo', 'success');
                     document.getElementById('camera-info').classList.remove('hidden');
                     document.getElementById('camera-info').textContent = `📡 ${cameraName}`;
-                    document.getElementById('camera-name-display').textContent = cameraName;
                     document.getElementById('start-camera-btn').classList.add('hidden');
                     document.getElementById('stop-camera-btn').classList.remove('hidden');
                     document.getElementById('motion-controls').classList.remove('hidden');
                     break;
+
                 case 'viewer-joined':
                     console.log('👁️ Viewer conectado:', data.viewerId);
                     await createPeerConnection(data.viewerId);
                     break;
+
                 case 'answer':
                     const pc = peerConnections.get(data.from);
                     if (pc) {
@@ -630,6 +446,7 @@ async function startCamera() {
                         await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
                     }
                     break;
+
                 case 'ice-candidate':
                     const peerConn = peerConnections.get(data.from);
                     if (peerConn && data.candidate) {
@@ -637,9 +454,14 @@ async function startCamera() {
                         await peerConn.addIceCandidate(new RTCIceCandidate(data.candidate));
                     }
                     break;
+
+                case 'auth-failed':
+                    showStatus('camera-status', '❌ Sesión expirada - Inicie sesión nuevamente', 'error');
+                    setTimeout(logout, 2000);
+                    break;
+
                 case 'error':
                     showStatus('camera-status', `❌ ${data.message}`, 'error');
-                    stopCamera();
                     break;
             }
         };
@@ -745,7 +567,6 @@ function stopCamera() {
     document.getElementById('camera-info').classList.add('hidden');
     document.getElementById('start-camera-btn').classList.remove('hidden');
     document.getElementById('stop-camera-btn').classList.add('hidden');
-    document.getElementById('camera-name-display').textContent = '';
     showStatus('camera-status', '', 'info');
 }
 
@@ -763,41 +584,58 @@ function connectViewer() {
 
     ws.onopen = () => {
         ws.send(JSON.stringify({
-            type: 'register-viewer',
+            type: 'authenticate',
             token: authToken
         }));
-        showStatus('viewer-status', '✅ Conectado', 'success');
     };
 
     ws.onmessage = async (event) => {
         const data = JSON.parse(event.data);
         
         switch(data.type) {
+            case 'authenticated':
+                ws.send(JSON.stringify({
+                    type: 'register-viewer'
+                }));
+                showStatus('viewer-status', '✅ Conectado', 'success');
+                break;
+
             case 'registered':
                 myId = data.id;
                 console.log('✅ Viewer registrado con ID:', myId);
                 document.getElementById('motion-alerts-panel').classList.remove('hidden');
                 requestNotificationPermission();
                 break;
+
             case 'camera-list':
                 displayCameras(data.cameras);
                 break;
+
             case 'offer':
                 await handleOffer(data.offer, data.from);
                 break;
+
             case 'ice-candidate':
                 const pc = peerConnections.get(data.from);
                 if (pc && data.candidate) {
                     await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
                 }
                 break;
+
             case 'camera-disconnected':
                 showStatus('viewer-status', '❌ La cámara se desconectó', 'error');
                 backToCameraList();
                 break;
+
             case 'motion-alert':
                 handleMotionAlert(data);
                 break;
+
+            case 'auth-failed':
+                showStatus('viewer-status', '❌ Sesión expirada - Inicie sesión nuevamente', 'error');
+                setTimeout(logout, 2000);
+                break;
+
             case 'error':
                 showStatus('viewer-status', `❌ ${data.message}`, 'error');
                 break;
@@ -811,19 +649,18 @@ function connectViewer() {
 
 function displayCameras(cameras) {
     const listEl = document.getElementById('cameras-list');
+    listEl.classList.remove('hidden');
     
     console.log('📹 Mostrando cámaras:', cameras);
     
     if (cameras.length === 0) {
-        listEl.innerHTML = '<p style="text-align: center; color: #94a3b8;">No hay cámaras disponibles o no tienes permisos asignados</p>';
+        listEl.innerHTML = '<p style="text-align: center; color: #94a3b8;">No hay cámaras disponibles</p>';
         return;
     }
 
     listEl.innerHTML = cameras.map(cam => `
         <div class="camera-card" onclick="watchCamera('${cam.id}', '${cam.name}')">
             <h3>📹 ${cam.name}</h3>
-            ${cam.location ? `<p>📍 ${cam.location}</p>` : ''}
-            ${cam.description ? `<p>💬 ${cam.description}</p>` : ''}
             <p>👁️ ${cam.viewers} espectador(es)</p>
             <p style="margin-top: 5px; color: #6ee7b7;">🟢 En línea</p>
         </div>
@@ -833,7 +670,7 @@ function displayCameras(cameras) {
 function watchCamera(cameraId, cameraName) {
     console.log('🎥 Solicitando ver cámara:', cameraId, cameraName);
     
-    document.getElementById('cameras-list').style.display = 'none';
+    document.getElementById('cameras-list').classList.add('hidden');
     document.getElementById('viewer-video-container').classList.remove('hidden');
     document.getElementById('viewer-info').textContent = `📹 ${cameraName}`;
 
@@ -898,359 +735,27 @@ function backToCameraList() {
     peerConnections.clear();
     document.getElementById('viewer-video').srcObject = null;
     document.getElementById('viewer-video-container').classList.add('hidden');
-    document.getElementById('cameras-list').style.display = 'grid';
+    document.getElementById('cameras-list').classList.remove('hidden');
 }
 
-// ==================== ADMIN - USUARIOS ====================
-async function loadUsers() {
-    try {
-        const response = await fetch('/api/admin/users', {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
-        const data = await response.json();
-        
-        if (data.users) {
-            displayUsers(data.users);
-        }
-    } catch (error) {
-        document.getElementById('users-list').innerHTML = 
-            '<p style="text-align: center; color: #ef4444;">Error cargando usuarios</p>';
+function disconnectViewer() {
+    if (ws) {
+        ws.close();
     }
-}
-
-function displayUsers(users) {
-    if (users.length === 0) {
-        document.getElementById('users-list').innerHTML = 
-            '<p style="text-align: center; color: #94a3b8;">No hay usuarios registrados</p>';
-        return;
-    }
-
-    const table = `
-        <table class="table">
-            <thead>
-                <tr>
-                    <th>Usuario</th>
-                    <th>Rol</th>
-                    <th>Cámaras</th>
-                    <th>Acciones</th>
-                </tr>
-            </thead>
-            <tbody>
-                ${users.map(user => `
-                    <tr>
-                        <td>${user.username}</td>
-                        <td>${user.role === 'admin' ? '👑 Admin' : '👤 Usuario'}</td>
-                        <td>${user.role === 'admin' ? 'Todas' : (user.allowedCameras.length || 'Ninguna')}</td>
-                        <td>
-                            ${user.username !== 'admin' ? `
-                                <button class="btn btn-secondary btn-small" onclick="editUser('${user.username}')">Editar</button>
-                                <button class="btn btn-danger btn-small" onclick="deleteUser('${user.username}')">Eliminar</button>
-                            ` : '<span style="color: #64748b;">-</span>'}
-                        </td>
-                    </tr>
-                `).join('')}
-            </tbody>
-        </table>
-    `;
-    document.getElementById('users-list').innerHTML = table;
-}
-
-async function showUserModal(username = null) {
-    editingUser = username;
-    document.getElementById('user-modal-title').textContent = username ? 'Editar Usuario' : 'Crear Usuario';
-    document.getElementById('modal-username').value = username || '';
-    document.getElementById('modal-password').value = '';
-    document.getElementById('modal-username').disabled = !!username;
-
-    await loadCameraConfigsForModal();
-
-    document.getElementById('user-modal').classList.remove('hidden');
-}
-
-async function loadCameraConfigsForModal() {
-    try {
-        const response = await fetch('/api/admin/camera-configs', {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
-        const data = await response.json();
-        const cameras = data.cameras || [];
-
-        let userCameras = [];
-        if (editingUser) {
-            const userResponse = await fetch('/api/admin/users', {
-                headers: { 'Authorization': `Bearer ${authToken}` }
-            });
-            const userData = await userResponse.json();
-            const user = userData.users.find(u => u.username === editingUser);
-            if (user) {
-                userCameras = user.allowedCameras;
-            }
-        }
-
-        const checkboxesContainer = document.getElementById('cameras-checkboxes');
-        
-        if (cameras.length === 0) {
-            checkboxesContainer.innerHTML = '<p style="color: #94a3b8;">No hay cámaras registradas. Crea cámaras primero en la pestaña "📹 Cámaras"</p>';
-        } else {
-            checkboxesContainer.innerHTML = cameras.map(cam => `
-                <label>
-                    <input type="checkbox" value="${cam.id}" ${userCameras.includes(cam.id) ? 'checked' : ''}>
-                    ${cam.name} ${cam.isActive ? '🟢' : '⚫'}
-                </label>
-            `).join('');
-        }
-    } catch (error) {
-        console.error('Error cargando cámaras:', error);
-    }
-}
-
-function closeUserModal() {
-    document.getElementById('user-modal').classList.add('hidden');
-    document.getElementById('modal-status').innerHTML = '';
-    editingUser = null;
-}
-
-async function saveUser() {
-    const username = document.getElementById('modal-username').value.trim();
-    const password = document.getElementById('modal-password').value;
+    peerConnections.forEach(pc => pc.close());
+    peerConnections.clear();
     
-    const checkboxes = document.querySelectorAll('#cameras-checkboxes input[type="checkbox"]:checked');
-    const allowedCameras = Array.from(checkboxes).map(cb => cb.value);
-
-    if (!username) {
-        showStatus('modal-status', 'El nombre de usuario es requerido', 'error');
-        return;
-    }
-
-    if (!editingUser && !password) {
-        showStatus('modal-status', 'La contraseña es requerida', 'error');
-        return;
-    }
-
-    try {
-        const url = editingUser 
-            ? `/api/admin/users/${editingUser}` 
-            : '/api/admin/users';
-        
-        const method = editingUser ? 'PUT' : 'POST';
-        
-        const body = { allowedCameras };
-        if (!editingUser) {
-            body.username = username;
-        }
-        if (password) {
-            body.password = password;
-        }
-
-        const response = await fetch(url, {
-            method,
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
-            },
-            body: JSON.stringify(body)
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            showStatus('modal-status', `✅ ${data.message}`, 'success');
-            setTimeout(() => {
-                closeUserModal();
-                loadUsers();
-            }, 1500);
-        } else {
-            showStatus('modal-status', `❌ ${data.error}`, 'error');
-        }
-    } catch (error) {
-        showStatus('modal-status', '❌ Error de conexión', 'error');
-    }
-}
-
-async function editUser(username) {
-    showUserModal(username);
-}
-
-async function deleteUser(username) {
-    if (!confirm(`¿Estás seguro de eliminar al usuario "${username}"?`)) {
-        return;
-    }
-
-    try {
-        const response = await fetch(`/api/admin/users/${username}`, {
-            method: 'DELETE',
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            loadUsers();
-        } else {
-            alert(`Error: ${data.error}`);
-        }
-    } catch (error) {
-        alert('Error de conexión');
-    }
-}
-
-// ==================== ADMIN - CÁMARAS ====================
-async function loadCameraConfigsAdmin() {
-    try {
-        const response = await fetch('/api/admin/camera-configs', {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
-        const data = await response.json();
-        
-        if (data.cameras) {
-            displayCameraConfigs(data.cameras);
-        }
-    } catch (error) {
-        document.getElementById('cameras-config-list').innerHTML = 
-            '<p style="text-align: center; color: #ef4444;">Error cargando cámaras</p>';
-    }
-}
-
-function displayCameraConfigs(cameras) {
-    if (cameras.length === 0) {
-        document.getElementById('cameras-config-list').innerHTML = 
-            '<p style="text-align: center; color: #94a3b8;">No hay cámaras registradas</p>';
-        return;
-    }
-
-    const table = `
-        <table class="table">
-            <thead>
-                <tr>
-                    <th>Nombre</th>
-                    <th>Ubicación</th>
-                    <th>Estado</th>
-                    <th>Acciones</th>
-                </tr>
-            </thead>
-            <tbody>
-                ${cameras.map(cam => `
-                    <tr>
-                        <td><strong>${cam.name}</strong><br><small style="color: #94a3b8;">${cam.description || 'Sin descripción'}</small></td>
-                        <td>${cam.location || 'Sin ubicación'}</td>
-                        <td>${cam.isActive ? '<span style="color: #6ee7b7;">🟢 Activa</span>' : '<span style="color: #64748b;">⚫ Inactiva</span>'}</td>
-                        <td>
-                            <button class="btn btn-secondary btn-small" onclick="editCamera('${cam.id}')">Editar</button>
-                            <button class="btn btn-danger btn-small" onclick="deleteCamera('${cam.id}')">Eliminar</button>
-                        </td>
-                    </tr>
-                `).join('')}
-            </tbody>
-        </table>
-    `;
-    document.getElementById('cameras-config-list').innerHTML = table;
-}
-
-function showCameraModal(cameraId = null) {
-    editingCamera = cameraId;
-    document.getElementById('camera-modal-title').textContent = cameraId ? 'Editar Cámara' : 'Registrar Cámara';
-    
-    if (cameraId) {
-        const camera = allCameraConfigs.find(c => c.id === cameraId);
-        if (camera) {
-            document.getElementById('modal-camera-name').value = camera.name;
-            document.getElementById('modal-camera-location').value = camera.location || '';
-            document.getElementById('modal-camera-description').value = camera.description || '';
-        }
-    } else {
-        document.getElementById('modal-camera-name').value = '';
-        document.getElementById('modal-camera-location').value = '';
-        document.getElementById('modal-camera-description').value = '';
-    }
-
-    document.getElementById('camera-modal').classList.remove('hidden');
-}
-
-function closeCameraModal() {
-    document.getElementById('camera-modal').classList.add('hidden');
-    document.getElementById('camera-modal-status').innerHTML = '';
-    editingCamera = null;
-}
-
-async function saveCameraConfig() {
-    const name = document.getElementById('modal-camera-name').value.trim();
-    const location = document.getElementById('modal-camera-location').value.trim();
-    const description = document.getElementById('modal-camera-description').value.trim();
-
-    if (!name) {
-        showStatus('camera-modal-status', 'El nombre es requerido', 'error');
-        return;
-    }
-
-    try {
-        const url = editingCamera 
-            ? `/api/admin/camera-configs/${editingCamera}` 
-            : '/api/admin/camera-configs';
-        
-        const method = editingCamera ? 'PUT' : 'POST';
-
-        const response = await fetch(url, {
-            method,
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
-            },
-            body: JSON.stringify({ name, location, description })
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            showStatus('camera-modal-status', `✅ ${data.message}`, 'success');
-            setTimeout(() => {
-                closeCameraModal();
-                loadCameraConfigsAdmin();
-            }, 1500);
-        } else {
-            showStatus('camera-modal-status', `❌ ${data.error}`, 'error');
-        }
-    } catch (error) {
-        showStatus('camera-modal-status', '❌ Error de conexión', 'error');
-    }
-}
-
-async function editCamera(cameraId) {
-    await loadCameraConfigsAdmin();
-    const response = await fetch('/api/admin/camera-configs', {
-        headers: { 'Authorization': `Bearer ${authToken}` }
-    });
-    const data = await response.json();
-    allCameraConfigs = data.cameras || [];
-    
-    showCameraModal(cameraId);
-}
-
-async function deleteCamera(cameraId) {
-    if (!confirm('¿Estás seguro de eliminar esta cámara? Se eliminará de todos los permisos de usuarios.')) {
-        return;
-    }
-
-    try {
-        const response = await fetch(`/api/admin/camera-configs/${cameraId}`, {
-            method: 'DELETE',
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            loadCameraConfigsAdmin();
-        } else {
-            alert(`Error: ${data.error}`);
-        }
-    } catch (error) {
-        alert('Error de conexión');
-    }
+    document.getElementById('viewer-video').srcObject = null;
+    document.getElementById('cameras-list').classList.add('hidden');
+    document.getElementById('viewer-video-container').classList.add('hidden');
+    showStatus('viewer-status', '', 'info');
 }
 
 // ==================== UTILIDADES ====================
 function showStatus(elementId, message, type) {
     const statusEl = document.getElementById(elementId);
+    if (!statusEl) return;
+    
     statusEl.className = `status ${type}`;
     statusEl.textContent = message;
     if (!message) statusEl.style.display = 'none';
